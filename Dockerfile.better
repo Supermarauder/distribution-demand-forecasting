@@ -1,0 +1,7 @@
+FROM davidwilson175/byu-is-555:latest
+
+COPY plumber.R /opt/ml/plumber.R
+COPY models/ /opt/ml/models
+
+EXPOSE 8000
+ENTRYPOINT ["R", "-e", "pr <- plumber::plumb('/opt/ml/plumber.R'); pr$run(host = '0.0.0.0', port = 8000)"]
