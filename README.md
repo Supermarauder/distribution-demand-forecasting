@@ -1,130 +1,92 @@
-# Sales Analytics Data Pipeline
+# Distribution Center Demand Forecasting
 
-An end-to-end analytics pipeline that moves operational sales and support data from PostgreSQL and MongoDB into Snowflake, models it with dbt, and serves a Snowsight reporting dashboard.
+A weekly demand forecasting pipeline predicting shipment volumes up to 24 weeks out, built in R and deployed as a live Docker API endpoint. Compares Prophet, ARIMA, and ARIMA+XGBoost against a held-out test set to support staffing, inventory, and transportation planning decisions.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    PG[(PostgreSQL\norders & order_details)] --> PROC
-    MG[(MongoDB\nchat_logs)] --> PROC
-    PROC[Python ETL Processor\nwatermark-based incremental] --> STG
-    STG[Snowflake Internal Stages\nCSV & JSON] --> RAW
-    RAW[Raw Tables\nSnowflake Tasks] --> DBT
-    DBT[dbt\n16 models · 4 custom tests] --> DASH
-    DASH[Snowsight Dashboard\nsales & campaign reporting]
+    DATA[Weekly Shipment Data\nCSV source] --> PIPE
+    PIPE[R Forecasting Pipeline\ntidymodels + modeltime] --> EVAL
+    EVAL[Model Evaluation\n24-week held-out test set] --> SEL
+    SEL[Selected Model\nProphet] --> API
+    API[Plumber REST API\nDeployed via Docker + vetiver]
 ```
 
-## What This Project Does
+## Business Context
 
-This project takes data from two source systems and three data streams, then turns them into analytics-ready warehouse models:
+Regional distribution centers live and die by their ability to anticipate demand. Understocking during a high-volume week means delayed shipments and frustrated customers. Overstocking means excess inventory, wasted warehouse space, and tied-up capital.
 
-1. A Python ETL service extracts incremental sales data from PostgreSQL and chat logs from MongoDB.
-2. The ETL service lands those extracts into Snowflake internal stages.
-3. Snowflake tasks load staged files into raw tables and clean up processed files.
-4. dbt stages and transforms the raw data into reusable warehouse models.
-5. Final analysis models support sales and email-performance reporting, including a Snowsight dashboard layer.
+This pipeline builds a weekly demand forecasting model predicting units shipped up to 24 weeks into the future, giving operations teams the visibility they need to make smarter staffing, inventory, and transportation decisions before demand arrives — not after.
 
-## End-to-End Flow
+## Modeling Approach
 
-### 1. Source systems and containerized generation
+The pipeline is built in R using the tidymodels ecosystem. modeltime extends tidymodels into time series territory, wrapping classical forecasting engines into a consistent interface for apples-to-apples comparison. All models were trained on the same recipe and evaluated against a 24-week held-out test set.
 
-The Docker Compose environment brings up the transactional sources and supporting services:
+Three candidate models were built and compared:
 
-- PostgreSQL stores the core sales data.
-- MongoDB stores the chat log data.
-- A generator container continuously produces new records.
-- The processor container reads from the sources and publishes files to Snowflake stages.
-- Adminer is available for database inspection.
+| Model | Engine | Why Chosen |
+| --- | --- | --- |
+| Auto ARIMA | auto_arima | Classical baseline that handles trend and yearly seasonality automatically |
+| ARIMA + XGBoost | auto_arima_xgboost | Combines ARIMA's seasonal backbone with XGBoost modeling the residuals |
+| Prophet | prophet | Designed for business time series with multiple seasonalities and holiday flags |
 
-### 2. Incremental Python ETL
+**Prophet was selected as the final model.** It outperformed both alternatives on every key metric — lowest MAE (19,782 units), lowest RMSE (25,365 units), and highest R-squared (0.41) on the 24-week test set. The dramatically lower RMSE compared to ARIMA+XGBoost indicated Prophet handled high-demand spike weeks more robustly.
 
-The processor in [processor/main.py](processor/main.py) is the orchestration entry point. It uses helper modules in [processor/etl](processor/etl) and [processor/utils](processor/utils) to:
+## Key Results
 
-- load environment variables from the selected `.env` file,
-- connect to PostgreSQL, MongoDB, and Snowflake,
-- read the last successful watermark for each source,
-- extract only new rows since that watermark,
-- write the extracts to stage files as CSV or JSON,
-- upload those files into Snowflake internal stages, and
-- update the watermark after each successful load.
+| Model | MAE | RMSE | MAPE | R² |
+| --- | --- | --- | --- | --- |
+| Auto ARIMA | 19,911 | 30,633 | 25.4% | 0.06 |
+| ARIMA + XGBoost | 20,292 | 39,680 | 26.7% | 0.02 |
+| **Prophet (selected)** | **19,782** | **25,365** | **27.4%** | **0.41** |
 
-This keeps the processor incremental instead of re-exporting the same data on every run.
+### Forecast Comparison — Test Period
+![Forecast Comparison](plots/forecast_comparison.png)
 
-The three data streams handled by the processor are:
+### Forward Forecast — Next 24 Weeks
+![Forward Forecast](plots/forward_forecast.png)
 
-- `orders` from PostgreSQL,
-- `order_details` from PostgreSQL, and
-- `chat_logs` from MongoDB.
+## AI Strategy
 
-### 3. Snowflake raw landing and automation
+This project used AI as a collaborative pair programmer across two phases, with two different tools playing different roles.
 
-The warehouse bootstrap script in [load_stages.sql](load_stages.sql) defines the raw landing tables and the automation that moves staged files into them.
+**Phase 1 (Planning)** was conducted with DeepSeek. The planning session helped identify early that the dataset's peak period labeling was incomplete — several weeks with shipment volumes equal to or exceeding labeled holiday peaks carried no flag at all. That observation shaped modeling priorities from the start.
 
-It creates:
+**Phases 2–4 (Building)** were completed with Claude — most useful for iterative debugging, explaining what each modeltime function was doing under the hood, and diagnosing issues like a Dockerfile dependency conflict with pandoc-citeproc.
 
-- `orders_raw`
-- `order_details_raw`
-- `chat_logs_raw`
-- file formats for CSV and JSON ingestion
-- Snowflake tasks that COPY data from each stage into the matching raw table
-- cleanup tasks that remove processed files from the stages
+**Where I pushed back:** The clearest example was model selection. Visually, ARIMA+XGBoost appeared to track the actual series more closely, and I challenged the recommendation to go with Prophet on that basis. After digging deeper into how RMSE penalizes spike-week errors differently than visual fit suggests, I made the call to go with Prophet — but it was my call, made after genuinely interrogating the tradeoff.
 
-The result is a hands-off ingestion layer inside Snowflake: once the processor writes files to the stages, Snowflake can load and clear them automatically.
-
-### 4. dbt staging and transformation
-
-The dbt project in [dbt/](dbt) organizes the warehouse into staging, intermediate, and analytical layers across 16 models:
-
-- 5 Adventure DB staging models (customers, inventory, products, vendors, product_vendors)
-- 6 e-commerce models (3 base + 3 staging for sales orders, email campaigns, purchase orders)
-- 2 real-time models (base + staging for chat logs)
-- 3 intermediate models (line items, orders with campaign, orders with customers)
-
-The intermediate layer combines staged sources into business-ready structures:
-
-- [int_sales_order_line_items.sql](dbt/models/intermediate/int_sales_order_line_items.sql) flattens order details into line items.
-- [int_sales_orders_with_campaign.sql](dbt/models/intermediate/int_sales_orders_with_campaign.sql) links conversions back to campaign events.
-- [int_sales_order_with_customers.sql](dbt/models/intermediate/int_sales_order_with_customers.sql) joins sales to customers and prepares a 30-day sales summary by country.
-
-### 5. Analytics and validation
-
-The analytical queries in [dbt/analyses](dbt/analyses) provide reporting views:
-
-- [campaign_sales_analysis.sql](dbt/analyses/campaign_sales_analysis.sql) summarizes campaign performance by segment, product category, and ad strategy.
-- [email_campaign_performance.sql](dbt/analyses/email_campaign_performance.sql) measures opens, clicks, add-to-cart activity, and conversions.
-
-The project includes 4 custom generic dbt tests enforcing business-critical data rules:
-
-- inventory quantities cannot be negative
-- preferred vendors must pass a credit check
-- a selected product field must remain fully null
-- each order may have only one conversion event
-
-## Repository Layout
-
-```bash
-compose.yml        # Local orchestration for source systems and the processor
-load_stages.sql    # Snowflake raw tables, file formats, COPY tasks, and cleanup tasks
-processor/         # Python ETL microservice
-dbt/               # dbt project with staging, intermediate, analyses, tests, and seeds
-screenshots/       # Reference images for the project walkthrough
-```
+**What I owned vs what AI drove:** The top-level thinking was mine — particularly the emphasis on identifying unlabeled peak periods as a core business problem worth solving. The more technical depth — model syntax, recipe construction, the vetiver deployment pattern — was largely AI-driven, though I inspected every output and drew my own conclusions at each step.
 
 ## How to Run
 
-The pipeline requires a Snowflake account, a PostgreSQL instance, and a MongoDB instance. The Docker Compose environment handles the source systems and processor locally.
+**Reproduce the analysis:**
 
-1. Copy `.env.example` to `.env` and populate your Snowflake credentials, PostgreSQL connection string, and MongoDB URI
-2. Run `docker compose up` to start PostgreSQL, MongoDB, the data generator, and the processor
-3. Execute `load_stages.sql` in Snowflake to create raw tables, file formats, and ingestion tasks
-4. Run `dbt build` from the `dbt/` directory to execute all models and tests
-5. Open Snowsight and connect to the mart layer for dashboard queries
+1. Clone the repository
+2. Open `forecast_pipeline.R` in RStudio
+3. Install dependencies: `tidyverse`, `tidymodels`, `modeltime`, `timetk`, `lubridate`, `vetiver`, `pins`
+4. Run the script top to bottom
 
-The processor runs incrementally — watermarks are stored in PostgreSQL and updated after each successful load, so restarting it will not re-process already-ingested records.
+**Launch the Docker API:**
 
-## Known Limitations and What I'd Improve
+```bash
+docker build -t forecast-api .
+docker run -p 8000:8000 forecast-api
+```
 
-- **No error handling in the processor:** if a source connection fails mid-run, the pipeline crashes without a useful error message and the watermark does not update. The next iteration would wrap each extract/load block in try/except with structured logging and dead-letter handling for failed records.
-- **No CI/CD:** dbt tests run manually. A GitHub Actions workflow running `dbt build` on every push would catch regressions automatically.
-- **Snowflake task scheduling is manual:** tasks are defined in `load_stages.sql` but require manual activation. Airflow or Prefect would give proper DAG-level observability and retry logic.
+Visit `http://127.0.0.1:8000/__docs__/` to explore the live endpoint.
+
+**Send a prediction request:**
+
+```r
+library(vetiver)
+v_api <- vetiver_endpoint("http://127.0.0.1:8000/predict")
+predict(v_api, new_data)
+```
+
+## What I'd Improve
+
+- **Peak period feature engineering:** the current binary holiday flag misses unlabeled spike weeks entirely. A better feature would capture shipment volume anomalies relative to a rolling baseline, regardless of whether the business labeled them as peaks.
+- **Hyperparameter tuning:** Prophet was selected with one manual adjustment. A proper grid search over changepoint scale, seasonality mode, and holiday weighting would likely push accuracy meaningfully further.
+- **Automated retraining:** the model is static. A production version would retrain on a rolling window as new shipment data arrives, with drift monitoring to flag when the forecast degrades.
